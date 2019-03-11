@@ -3,6 +3,9 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/haxii/daemon"
@@ -20,35 +23,65 @@ var (
 	_         = flag.String("s", daemon.UsageDefaultName, daemon.UsageMessage)
 )
 
+type fakeEvent struct{ path string }
+
+func (e *fakeEvent) Event() notify.Event { return notify.Create }
+func (e *fakeEvent) Path() string        { return e.path }
+func (e *fakeEvent) Sys() interface{}    { return nil }
+
+func loadExistingDirs(dirWatcher chan notify.EventInfo) {
+	err := filepath.Walk(*configDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(path, "kubeconfig") {
+			dirWatcher <- &fakeEvent{path}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func main() {
 	flag.Parse()
 	dirWatcher := make(chan notify.EventInfo, 100)
+	go loadExistingDirs(dirWatcher)
 	if err := notify.Watch(*configDir, dirWatcher, notify.Create); err != nil {
 		log.Fatal(err)
 	}
 	for {
 		e := <-dirWatcher
-		if strings.HasSuffix(e.Path(), "kubeconfig") {
-			log.Printf("new file in %s", e.Path())
-		} else {
-			log.Printf("NOT new file in %s", e.Path())
+		fi, err := os.Stat(e.Path())
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("event for %s", e.Path())
+		if fi.Mode().IsDir() {
+			if path.Dir(e.Path()) == *configDir {
+				log.Printf("watching subdir %s", e.Path())
+				if err := notify.Watch(e.Path(), dirWatcher, notify.Create); err != nil {
+					log.Fatal(err)
+				}
+			}
+		} else if strings.HasSuffix(e.Path(), "kubeconfig") {
+			log.Printf("new kubeconfig in %s", e.Path())
+			go watch(e.Path())
 		}
 	}
 }
 
-func watch(kubeconfig *string) {
-
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+func watch(kubeconfig string) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// create the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	pods, _ := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{})
 	netpol, _ := clientset.NetworkingV1().NetworkPolicies("").Watch(metav1.ListOptions{})
 	deploys, _ := clientset.AppsV1().Deployments("").Watch(metav1.ListOptions{})
@@ -56,6 +89,7 @@ func watch(kubeconfig *string) {
 	podChan := pods.ResultChan()
 	netChan := netpol.ResultChan()
 	deployChan := deploys.ResultChan()
+
 	for {
 		select {
 		case e := <-podChan:
