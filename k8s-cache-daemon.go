@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/haxii/daemon"
 	"github.com/rjeczalik/notify"
@@ -29,8 +31,8 @@ func (e *fakeEvent) Event() notify.Event { return notify.Create }
 func (e *fakeEvent) Path() string        { return e.path }
 func (e *fakeEvent) Sys() interface{}    { return nil }
 
-func loadExistingDirs(dirWatcher chan notify.EventInfo) {
-	err := filepath.Walk(*configDir, func(path string, info os.FileInfo, err error) error {
+func loadDir(dir string, dirWatcher chan notify.EventInfo) {
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -40,31 +42,28 @@ func loadExistingDirs(dirWatcher chan notify.EventInfo) {
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("error loading existing dir %s", err)
 	}
 }
 
 func main() {
 	flag.Parse()
 	dirWatcher := make(chan notify.EventInfo, 100)
-	go loadExistingDirs(dirWatcher)
+	go loadDir(*configDir, dirWatcher)
 	if err := notify.Watch(*configDir, dirWatcher, notify.Create); err != nil {
-		log.Fatal(err)
+		log.Printf("error watching config dir %s %s", *configDir, err)
 	}
 	for {
 		e := <-dirWatcher
 		fi, err := os.Stat(e.Path())
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("error receiving event %s", err)
+			continue
 		}
-		log.Printf("event for %s", e.Path())
 		if fi.Mode().IsDir() {
-			if path.Dir(e.Path()) == *configDir {
-				log.Printf("watching subdir %s", e.Path())
-				if err := notify.Watch(e.Path(), dirWatcher, notify.Create); err != nil {
-					log.Fatal(err)
-				}
-			}
+			log.Printf("loading subdir %s", e.Path())
+			time.Sleep(1000 * time.Millisecond)
+			loadDir(e.Path(), dirWatcher)
 		} else if strings.HasSuffix(e.Path(), "kubeconfig") {
 			log.Printf("new kubeconfig in %s", e.Path())
 			go watch(e.Path())
@@ -72,19 +71,35 @@ func main() {
 	}
 }
 
-func watch(kubeconfig string) {
+func watch(kubeconfig string) error {
+	log.Printf("attempting to watch %s", kubeconfig)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("%s %s", kubeconfig, err)
+		return err
 	}
+	configfile, err := clientcmd.LoadFromFile(kubeconfig)
+	context := reflect.ValueOf(configfile.Contexts).MapKeys()[0]
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("%s %s", kubeconfig, err)
+		return err
 	}
-
-	pods, _ := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{})
-	netpol, _ := clientset.NetworkingV1().NetworkPolicies("").Watch(metav1.ListOptions{})
-	deploys, _ := clientset.AppsV1().Deployments("").Watch(metav1.ListOptions{})
+	pods, err := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{})
+	if err != nil {
+		log.Printf("%s %s", kubeconfig, err)
+		return err
+	}
+	netpol, err := clientset.NetworkingV1().NetworkPolicies("").Watch(metav1.ListOptions{})
+	if err != nil {
+		log.Printf("%s %s", kubeconfig, err)
+		return err
+	}
+	deploys, err := clientset.AppsV1().Deployments("").Watch(metav1.ListOptions{})
+	if err != nil {
+		log.Printf("%s %s", kubeconfig, err)
+		return err
+	}
 
 	podChan := pods.ResultChan()
 	netChan := netpol.ResultChan()
@@ -93,20 +108,32 @@ func watch(kubeconfig string) {
 	for {
 		select {
 		case e := <-podChan:
+			if e.Type == "ERROR" || e.Object == nil {
+				log.Printf("%s %s", kubeconfig, e)
+				return errors.New("nil from k8s client")
+			}
 			o := e.Object.(*v1.Pod)
-			if o.Namespace == "kube-system" {
+			if o.Namespace == "kube-system" || e.Type == "MODIFIED" {
 				continue
 			}
-			log.Printf("pod %s for %s in %s (%s)\n", e.Type, o.Name, o.Status.Phase, o.Namespace)
+			log.Printf("pod %s for %s in %s (%s)\n", e.Type, o.Name, context, o.Namespace)
 		case e := <-netChan:
+			if e.Type == "ERROR" || e.Object == nil {
+				log.Printf("%s %s", kubeconfig, e)
+				return errors.New("nil from k8s client")
+			}
 			o := e.Object.(*nv1.NetworkPolicy)
-			if o.Namespace == "kube-system" {
+			if o.Namespace == "kube-system" || e.Type != "MODIFIED" {
 				continue
 			}
 			log.Printf("nc %s %s (%s)\n", e.Type, o.Name, o.Namespace)
 		case e := <-deployChan:
+			if e.Type == "ERROR" || e.Object == nil {
+				log.Printf("%s %s", kubeconfig, e)
+				return errors.New("nil from k8s client")
+			}
 			o := e.Object.(*av1.Deployment)
-			if o.Namespace == "kube-system" {
+			if o.Namespace == "kube-system" || e.Type != "MODIFIED" {
 				continue
 			}
 			log.Printf("deploy %s %s (%s)\n", e.Type, o.Name, o.Namespace)

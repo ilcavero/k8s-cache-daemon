@@ -1,4 +1,0 @@
-#!/bin/sh
-go get k8s.io/client-go/...
-go get github.com/haxii/daemon
-go get "github.com/rjeczalik/notify"
