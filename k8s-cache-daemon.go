@@ -3,10 +3,10 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 
@@ -22,6 +22,7 @@ import (
 
 var (
 	configDir = flag.String("configDir", "", "absolute path to the dir containing configurations")
+	cacheDir  = flag.String("cacheDir", "", "absolute path to the dir containing caches")
 	_         = flag.String("s", daemon.UsageDefaultName, daemon.UsageMessage)
 )
 
@@ -79,7 +80,11 @@ func watch(kubeconfig string) error {
 		return err
 	}
 	configfile, err := clientcmd.LoadFromFile(kubeconfig)
-	context := reflect.ValueOf(configfile.Contexts).MapKeys()[0]
+	context := "nil"
+	for key := range configfile.Contexts {
+		context = key
+		break
+	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Printf("%s %s", kubeconfig, err)
@@ -116,7 +121,22 @@ func watch(kubeconfig string) error {
 			if o.Namespace == "kube-system" || e.Type == "MODIFIED" {
 				continue
 			}
-			log.Printf("pod %s for %s in %s (%s)\n", e.Type, o.Name, context, o.Namespace)
+			filename := filepath.Join(*cacheDir, fmt.Sprintf(context, "_pod"))
+			file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+			if err != nil {
+				log.Printf("failed to open file %s %s", filename, err)
+				return err
+			}
+			_, err = file.WriteString(fmt.Sprintf("pod %s for %s in %s (%s)\n", e.Type, o.Name, context, o.Namespace))
+			if err != nil {
+				log.Printf("failed to write file %s %s", filename, err)
+				return err
+			}
+			err = file.Close()
+			if err != nil {
+				log.Printf("failed to close file %s %s", filename, err)
+				return err
+			}
 		case e := <-netChan:
 			if e.Type == "ERROR" || e.Object == nil {
 				log.Printf("%s %s", kubeconfig, e)
